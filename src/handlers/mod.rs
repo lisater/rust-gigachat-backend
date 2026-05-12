@@ -64,11 +64,44 @@ use crate::config::AppConfig;
 use crate::models::{
     AskRequest, AskResponse, ErrorResponse, HealthResponse, SummarizeRequest, SummarizeResponse,
 };
-use crate::services::AiService;
+use crate::services::{AiService, MOCK_SUMMARIZE_SUMMARY_TAG, MOCK_SUMMARIZE_TERMS_TAG};
 
 /// Значение `max_terms` по умолчанию для `/summarize`,
 /// если клиент не указал собственное.
 const DEFAULT_MAX_KEY_TERMS: usize = 5;
+
+/// Разбирает структурированный ответ AI на блоки `<<<SUMMARY>>>` и `<<<TERMS>>>`.
+///
+/// Если ответ не содержит ожидаемых маркеров (например, GigaChat ответил
+/// «по-своему»), вся строка возвращается как `summary`, а `key_terms` —
+/// пустым списком. Это безопасный фолбэк, при котором клиент всё равно
+/// получает осмысленный результат.
+fn parse_summary_payload(answer: &str, max_terms: usize) -> (String, Vec<String>) {
+    let Some(summary_start) = answer.find(MOCK_SUMMARIZE_SUMMARY_TAG) else {
+        return (answer.trim().to_string(), Vec::new());
+    };
+
+    let after_summary_tag = &answer[summary_start + MOCK_SUMMARIZE_SUMMARY_TAG.len()..];
+    let (summary_block, terms_block) =
+        if let Some(terms_idx) = after_summary_tag.find(MOCK_SUMMARIZE_TERMS_TAG) {
+            let summary = &after_summary_tag[..terms_idx];
+            let terms = &after_summary_tag[terms_idx + MOCK_SUMMARIZE_TERMS_TAG.len()..];
+            (summary, terms)
+        } else {
+            (after_summary_tag, "")
+        };
+
+    let summary = summary_block.trim().to_string();
+    let key_terms: Vec<String> = terms_block
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(max_terms)
+        .map(str::to_string)
+        .collect();
+
+    (summary, key_terms)
+}
 
 // ============================================================================
 // ОБРАБОТЧИКИ ЭНДПОИНТОВ
@@ -317,9 +350,10 @@ pub async fn summarize(
     match ai_service.ask(&prompt).await {
         Ok(answer) => {
             info!("Summarize: got answer from {}", ai_service.name());
+            let (summary, key_terms) = parse_summary_payload(&answer, max_terms);
             Ok(Json(SummarizeResponse {
-                summary: answer,
-                key_terms: Vec::new(),
+                summary,
+                key_terms,
                 source: ai_service.name().to_lowercase(),
             }))
         }

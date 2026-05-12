@@ -396,15 +396,136 @@ impl Default for MockAiService {
     }
 }
 
+/// Маркер начала блока «выжимка» в структурированном mock-ответе для `/summarize`.
+pub const MOCK_SUMMARIZE_SUMMARY_TAG: &str = "<<<SUMMARY>>>";
+/// Маркер начала списка ключевых терминов.
+pub const MOCK_SUMMARIZE_TERMS_TAG: &str = "<<<TERMS>>>";
+
+/// Префикс промпта, по которому MockAiService узнаёт «конспектора».
+/// Должен совпадать с тем, что формирует `handlers::summarize`.
+const SUMMARIZE_PROMPT_PREFIX: &str = "Сделай краткий конспект";
+
+/// Строит структурированный mock-ответ для запроса конспектирования.
+///
+/// На вход принимается полный текст промпта, который формирует
+/// `handlers::summarize`. Функция извлекает из него:
+/// - желаемый максимум ключевых терминов («до N»),
+/// - исходный текст (всё, что после маркера «Текст:\n\n»),
+/// а затем считает простую «выжимку» (первое предложение) и список
+/// ключевых терминов (частотный анализ слов длиной ≥ 5 символов).
+///
+/// Возвращает строку в формате:
+/// ```text
+/// <<<SUMMARY>>>
+/// Первое предложение текста.
+/// <<<TERMS>>>
+/// term1
+/// term2
+/// term3
+/// ```
+/// Handler разбирает её обратно в `SummarizeResponse`.
+fn build_mock_summary_payload(prompt: &str) -> String {
+    let max_terms = extract_max_terms(prompt).unwrap_or(5);
+    let text = extract_source_text(prompt);
+
+    let summary = first_sentence(text).unwrap_or_else(|| text.trim().to_string());
+    let terms = top_frequent_terms(text, max_terms);
+
+    let mut out = String::with_capacity(text.len() / 4 + 64);
+    out.push_str(MOCK_SUMMARIZE_SUMMARY_TAG);
+    out.push('\n');
+    out.push_str(&summary);
+    out.push('\n');
+    out.push_str(MOCK_SUMMARIZE_TERMS_TAG);
+    out.push('\n');
+    for t in terms {
+        out.push_str(&t);
+        out.push('\n');
+    }
+    out
+}
+
+/// Извлекает число после фрагмента «до » в промпте (например, «до 5 ключевых …»).
+fn extract_max_terms(prompt: &str) -> Option<usize> {
+    let idx = prompt.find("до ")?;
+    let after = &prompt[idx + "до ".len()..];
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Извлекает «полезный» текст из промпта — всё, что после маркера «Текст:».
+fn extract_source_text(prompt: &str) -> &str {
+    if let Some(idx) = prompt.find("Текст:") {
+        let after = &prompt[idx + "Текст:".len()..];
+        after.trim_start_matches(|c: char| c == '\n' || c == '\r' || c == ' ')
+    } else {
+        prompt
+    }
+}
+
+/// Возвращает первое предложение текста (до `.`, `!`, `?`), включая знак,
+/// если оно непустое.
+fn first_sentence(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for (i, ch) in trimmed.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            let end = i + ch.len_utf8();
+            let candidate = trimmed[..end].trim();
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    Some(trimmed.trim().to_string())
+}
+
+/// Топ-N слов по частоте (длина ≥ 5 символов, регистр не учитывается,
+/// пунктуация отбрасывается). При равной частоте — лексикографический
+/// порядок, чтобы вывод был детерминирован.
+fn top_frequent_terms(text: &str, max_terms: usize) -> Vec<String> {
+    use std::collections::HashMap;
+
+    if max_terms == 0 {
+        return Vec::new();
+    }
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for raw in text.split_whitespace() {
+        let word: String = raw
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .collect::<String>()
+            .to_lowercase();
+        if word.chars().count() >= 5 {
+            *counts.entry(word).or_insert(0) += 1;
+        }
+    }
+
+    let mut pairs: Vec<(String, usize)> = counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs.into_iter().take(max_terms).map(|(w, _)| w).collect()
+}
+
 #[async_trait]
 impl AiService for MockAiService {
     async fn ask(&self, question: &str) -> Result<String, AiServiceError> {
+        // Специальная ветка: handler /summarize формирует промпт, который
+        // начинается с конкретного маркера. На этот класс запросов отвечаем
+        // структурированным mock-результатом, чтобы handler мог разобрать
+        // выжимку и список ключевых терминов независимо от языка модели.
+        if question.starts_with(SUMMARIZE_PROMPT_PREFIX) {
+            return Ok(build_mock_summary_payload(question));
+        }
+
         // Return mock response based on question keywords
         let question_lower = question.to_lowercase();
-        
+
         // Check more specific topics BEFORE general "rust"
         // Note: Use word boundaries - "hi" should not match "this"
-        let is_greeting = question_lower.contains("hello") 
+        let is_greeting = question_lower.contains("hello")
             || question_lower.starts_with("hi ")
             || question_lower.starts_with("hi!")
             || question_lower.starts_with("hi,")
