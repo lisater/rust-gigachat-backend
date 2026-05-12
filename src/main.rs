@@ -66,7 +66,10 @@ mod services;
 
 // Импорт конкретных элементов из модулей для удобства использования
 use config::AppConfig;
-use handlers::{ask, cors_preflight, health, index, internal_error, not_found, unprocessable_entity};
+use handlers::{
+    ask, cors_preflight, health, index, internal_error, not_found, summarize,
+    unprocessable_entity,
+};
 use services::AiServiceFactory;
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::Header;
@@ -338,7 +341,7 @@ fn rocket() -> _ {
         //
         // catchers! работает аналогично для функций с #[catch(код)]
         // ─────────────────────────────────────────────────────────────────
-        .mount("/", routes![index, health, ask, cors_preflight])
+        .mount("/", routes![index, health, ask, summarize, cors_preflight])
         .register("/", catchers![not_found, internal_error, unprocessable_entity])
 }
 

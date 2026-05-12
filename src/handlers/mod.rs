@@ -61,8 +61,14 @@ use tracing::{error, info};
 use std::path::PathBuf;
 
 use crate::config::AppConfig;
-use crate::models::{AskRequest, AskResponse, ErrorResponse, HealthResponse};
+use crate::models::{
+    AskRequest, AskResponse, ErrorResponse, HealthResponse, SummarizeRequest, SummarizeResponse,
+};
 use crate::services::AiService;
+
+/// Значение `max_terms` по умолчанию для `/summarize`,
+/// если клиент не указал собственное.
+const DEFAULT_MAX_KEY_TERMS: usize = 5;
 
 // ============================================================================
 // ОБРАБОТЧИКИ ЭНДПОИНТОВ
@@ -107,7 +113,8 @@ pub fn index(config: &State<AppConfig>) -> String {
         Доступные эндпоинты:\n\
         - GET  /           - Это сообщение\n\
         - GET  /health     - Проверка состояния сервера\n\
-        - POST /ask        - Задать вопрос AI помощнику\n\n\
+        - POST /ask        - Задать вопрос AI помощнику\n\
+        - POST /summarize  - Краткий конспект текста + ключевые термины\n\n\
         Пример запроса:\n\
         curl -X POST http://localhost:8000/ask \\\n\
           -H \"Content-Type: application/json\" \\\n\
@@ -253,6 +260,73 @@ pub async fn ask(
             error!("Error getting answer: {}", e);
             Err(Json(ErrorResponse::with_code(
                 format!("Failed to get answer: {}", e),
+                "AI_SERVICE_ERROR",
+            )))
+        }
+    }
+}
+
+/// Обработчик эндпоинта конспектирования текста («Умный конспектор», ЛР1 тема 1).
+///
+/// Принимает произвольный текст в поле `text` и возвращает краткую выжимку
+/// плюс список ключевых терминов. В качестве «движка» используется
+/// `AiService` — тот же сервис, что и для `/ask` (Mock или GigaChat).
+///
+/// # Эндпоинт
+///
+/// `POST /summarize`
+///
+/// # Пример запроса
+///
+/// ```bash
+/// curl -X POST http://localhost:8000/summarize \
+///   -H "Content-Type: application/json" \
+///   -d '{"text": "Rust — современный системный язык программирования …", "max_terms": 3}'
+/// ```
+///
+/// # Текущее поведение (этап 3a лабораторной)
+///
+/// На этом этапе handler делегирует генерацию выжимки в `ai_service.ask()`
+/// с заранее подготовленным промптом. Поле `key_terms` пока заполняется
+/// пустым списком — структурированный разбор ответа добавляется на следующем
+/// этапе ЛР1 («mock-логика конспектирования»).
+#[post("/summarize", format = "json", data = "<request>")]
+pub async fn summarize(
+    request: Json<SummarizeRequest>,
+    ai_service: &State<Box<dyn AiService>>,
+) -> Result<Json<SummarizeResponse>, Json<ErrorResponse>> {
+    let text = request.text.trim();
+
+    info!("Received summarize request ({} chars)", text.len());
+
+    if text.is_empty() {
+        error!("Empty text for summarize");
+        return Err(Json(ErrorResponse::with_code(
+            "Text cannot be empty",
+            "EMPTY_TEXT",
+        )));
+    }
+
+    let max_terms = request.max_terms.unwrap_or(DEFAULT_MAX_KEY_TERMS);
+
+    let prompt = format!(
+        "Сделай краткий конспект следующего текста (1-2 предложения) и затем \
+         перечисли до {max_terms} ключевых терминов через запятую. Текст:\n\n{text}"
+    );
+
+    match ai_service.ask(&prompt).await {
+        Ok(answer) => {
+            info!("Summarize: got answer from {}", ai_service.name());
+            Ok(Json(SummarizeResponse {
+                summary: answer,
+                key_terms: Vec::new(),
+                source: ai_service.name().to_lowercase(),
+            }))
+        }
+        Err(e) => {
+            error!("Summarize: AI service error: {}", e);
+            Err(Json(ErrorResponse::with_code(
+                format!("Failed to summarize: {e}"),
                 "AI_SERVICE_ERROR",
             )))
         }
