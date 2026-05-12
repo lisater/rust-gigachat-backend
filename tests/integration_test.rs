@@ -47,7 +47,9 @@ use rocket::local::blocking::Client;
 
 // Импортируем из НАШЕГО крейта (как внешние пользователи)
 use rust_gigachat_demo::config::AppConfig;
-use rust_gigachat_demo::handlers::{ask, health, index, internal_error, not_found, unprocessable_entity};
+use rust_gigachat_demo::handlers::{
+    ask, health, index, internal_error, not_found, summarize, unprocessable_entity,
+};
 use rust_gigachat_demo::services::MockAiService;
 
 /// Создаёт тестовый экземпляр Rocket с mock-сервисом.
@@ -69,7 +71,7 @@ fn create_test_client() -> Client {
     let rocket = rocket::build()
         .manage(config)                    // State<AppConfig>
         .manage(ai_service)                // State<Box<dyn AiService>>
-        .mount("/", routes![index, health, ask])  // routes! - макрос!
+        .mount("/", routes![index, health, ask, summarize])  // routes! - макрос!
         .register("/", catchers![not_found, internal_error, unprocessable_entity]);
 
     // Client::tracked отслеживает cookies между запросами
@@ -158,6 +160,134 @@ fn test_not_found_endpoint() {
     
     let body = response.into_string().unwrap();
     assert!(body.contains("error"));
+}
+
+// ============================================================================
+// ТЕСТЫ ЭНДПОИНТА /summarize («Умный конспектор», ЛР1 тема 1)
+// ============================================================================
+
+/// Хелпер: разбирает JSON-ответ /summarize в три поля для удобства проверок.
+fn parse_summarize_body(body: &str) -> (String, Vec<String>, String) {
+    let v: serde_json::Value = serde_json::from_str(body).expect("response must be valid JSON");
+    let summary = v["summary"].as_str().unwrap_or_default().to_string();
+    let key_terms: Vec<String> = v["key_terms"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let source = v["source"].as_str().unwrap_or_default().to_string();
+    (summary, key_terms, source)
+}
+
+/// Happy path: связный текст из нескольких предложений →
+/// summary = первое предложение, key_terms = до 5 непустых слов.
+#[test]
+fn test_summarize_happy_path() {
+    let client = create_test_client();
+    let body = r#"{
+        "text": "Rust — современный системный язык программирования. Он обеспечивает безопасность памяти без сборщика мусора. Rust популярен для веб-серверов, встраиваемых систем и инструментов командной строки. Сообщество Rust большое и активное."
+    }"#;
+
+    let response = client
+        .post("/summarize")
+        .header(ContentType::JSON)
+        .body(body)
+        .dispatch();
+
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+    let (summary, key_terms, source) = parse_summarize_body(&response.into_string().unwrap());
+    assert!(
+        summary.starts_with("Rust"),
+        "summary должен начинаться с первого предложения, был: {summary}"
+    );
+    assert!(
+        summary.ends_with('.'),
+        "summary должен заканчиваться точкой, был: {summary}"
+    );
+    assert!(
+        !key_terms.is_empty() && key_terms.len() <= 5,
+        "key_terms должны быть непусты и ≤ 5, было: {key_terms:?}"
+    );
+    assert_eq!(source, "mock ai service");
+}
+
+/// Параметр `max_terms` уважается — handler ограничивает выдачу.
+#[test]
+fn test_summarize_respects_max_terms() {
+    let client = create_test_client();
+    let body = r#"{
+        "text": "Rocket — это веб-фреймворк для языка Rust. Rocket делает разработку быстрой и безопасной. Rocket поддерживает асинхронность, JSON и кастомные fairings.",
+        "max_terms": 2
+    }"#;
+
+    let response = client
+        .post("/summarize")
+        .header(ContentType::JSON)
+        .body(body)
+        .dispatch();
+
+    assert_eq!(response.status(), Status::Ok);
+    let (_, key_terms, _) = parse_summarize_body(&response.into_string().unwrap());
+    assert!(
+        key_terms.len() <= 2,
+        "key_terms должны быть не более 2, было: {key_terms:?}"
+    );
+}
+
+/// Пустой `text` → структурированная ошибка `EMPTY_TEXT`.
+#[test]
+fn test_summarize_empty_text() {
+    let client = create_test_client();
+    let response = client
+        .post("/summarize")
+        .header(ContentType::JSON)
+        .body(r#"{"text": ""}"#)
+        .dispatch();
+
+    let body = response.into_string().unwrap();
+    assert!(body.contains("\"error\""));
+    assert!(body.contains("\"EMPTY_TEXT\""));
+}
+
+/// JSON без поля `text` → 422 от catcher’а validation.
+#[test]
+fn test_summarize_missing_text_field() {
+    let client = create_test_client();
+    let response = client
+        .post("/summarize")
+        .header(ContentType::JSON)
+        .body(r#"{"max_terms": 3}"#)
+        .dispatch();
+
+    assert_eq!(response.status(), Status::UnprocessableEntity);
+    let body = response.into_string().unwrap();
+    assert!(body.contains("\"error\""));
+}
+
+/// `max_terms = 0` → пустой список ключевых терминов, summary всё ещё есть.
+#[test]
+fn test_summarize_zero_max_terms() {
+    let client = create_test_client();
+    let body = r#"{"text": "Rust — это язык программирования.", "max_terms": 0}"#;
+
+    let response = client
+        .post("/summarize")
+        .header(ContentType::JSON)
+        .body(body)
+        .dispatch();
+
+    assert_eq!(response.status(), Status::Ok);
+    let (summary, key_terms, _) = parse_summarize_body(&response.into_string().unwrap());
+    assert!(!summary.is_empty(), "summary должен быть непуст");
+    assert!(
+        key_terms.is_empty(),
+        "при max_terms=0 список должен быть пуст, было: {key_terms:?}"
+    );
 }
 
 #[test]
